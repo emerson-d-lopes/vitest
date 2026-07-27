@@ -50,6 +50,7 @@ export class PoolRunner {
   private _state: RunnerState = RunnerState.IDLE
   private _operationLock: DeferPromise<void> | null = null
   private _terminatePromise: DeferPromise<void> = createDefer()
+  private _channelErrorTimer: NodeJS.Timeout | undefined
 
   private _eventEmitter: EventEmitter<{
     message: [WorkerResponse]
@@ -269,6 +270,7 @@ export class PoolRunner {
 
     try {
       this._state = RunnerState.STOPPING
+      clearTimeout(this._channelErrorTimer)
 
       // Remove exit listener early to avoid "unexpected exit" errors during shutdown
       this.worker.off('exit', this.emitUnexpectedExit)
@@ -351,6 +353,26 @@ export class PoolRunner {
   private emitWorkerError = (maybeError: unknown): void => {
     const error = maybeError instanceof Error ? maybeError : new Error(String(maybeError))
 
+    // When a worker dies abruptly, a failed IPC write can surface as an EPIPE
+    // 'error' event before the worker's 'exit' event (observed on macOS, where
+    // the poll-phase write failure lands before the kqueue exit notification).
+    // Hold the raw channel error: the imminent 'exit' produces the informative
+    // exit code/signal error and moves the runner to STOPPED before the pool
+    // decides whether to reuse it for other test files. The timer covers the
+    // pathological case of the channel closing while the process stays alive
+    // (e.g. user code calling `process.disconnect()`).
+    const code = (error as NodeJS.ErrnoException).code
+    if (
+      (code === 'EPIPE' || code === 'ERR_IPC_CHANNEL_CLOSED')
+      && this._state !== RunnerState.STOPPING
+      && this._state !== RunnerState.STOPPED
+    ) {
+      this._channelErrorTimer ??= setTimeout(() => {
+        this._eventEmitter.emit('error', error)
+      }, 1_000).unref()
+      return
+    }
+
     this._eventEmitter.emit('error', error)
   }
 
@@ -371,6 +393,7 @@ export class PoolRunner {
   }
 
   private emitUnexpectedExit = (code?: number, signal?: string): void => {
+    clearTimeout(this._channelErrorTimer)
     const hasCode = typeof code === 'number'
     const errorDetails = hasCode || signal
       ? `with ${hasCode ? `exit code ${code} ` : ''}${signal ? `signal ${signal} ` : ''}`
